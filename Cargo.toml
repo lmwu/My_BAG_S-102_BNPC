@@ -7,3 +7,5 @@ edition = "2024"
 eframe = "0.28"
 gdal = "0.19"
 rfd = "0.14"
+hdf5 = { package = "hdf5-metno" , version = "0.14.1"}
+ndarray = "0.17.2"
