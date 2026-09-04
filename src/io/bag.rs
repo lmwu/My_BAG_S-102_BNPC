@@ -2,6 +2,7 @@ use eframe::egui;
 use gdal::raster::RasterBand;
 use gdal::spatial_ref::SpatialRef;
 use gdal::{Dataset, DatasetOptions, GdalOpenFlags, Metadata};
+use rayon::prelude::*;
 
 use crate::io::s102::write_s102_hdf5_file;
 use crate::models::{PreviewData, S102Point};
@@ -145,54 +146,62 @@ pub fn load_real_bag(
         .to_vec();
 
     if auto_align_depth {
-        for val in depth_buffer.iter_mut() {
+        depth_buffer.par_iter_mut().for_each(|val| {
             if *val != nodata_depth && !val.is_nan() {
                 *val = -(*val);
             }
-        }
+        });
     }
 
-    let valid_depths: Vec<f32> = depth_buffer
-        .iter()
+    // --- Rayon 平行計算極值 (Min / Max) ---
+    let (min_d, max_d) = depth_buffer
+        .par_iter()
         .copied()
         .filter(|&v| v != nodata_depth && !v.is_nan())
-        .collect();
-
-    let (min_d, max_d) = if !valid_depths.is_empty() {
-        (
-            valid_depths.iter().copied().fold(f32::INFINITY, f32::min),
-            valid_depths.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+        .fold(
+            || (f32::INFINITY, f32::NEG_INFINITY),
+            |(min, max), v| (min.min(v), max.max(v)),
         )
-    } else {
-        (0.0, 100.0)
-    };
+        .reduce(
+            || (f32::INFINITY, f32::NEG_INFINITY),
+            |(a_min, a_max), (b_min, b_max)| (a_min.min(b_min), a_max.max(b_max)),
+        );
 
-    let mut depth_pixels = Vec::with_capacity(width * height * 4);
-    let mut unc_pixels = Vec::with_capacity(width * height * 4);
+    let (min_d, max_d) = if min_d < max_d { (min_d, max_d) } else { (0.0, 100.0) };
 
-    for i in 0..(width * height) {
-        let d = depth_buffer[i];
-        let u = unc_buffer[i];
+    // --- Rayon 平行化像素 RGBA 轉換矩陣 ---
+    let total_pixels = width * height;
+    let mut depth_pixels = vec![0u8; total_pixels * 4];
+    let mut unc_pixels = vec![0u8; total_pixels * 4];
 
-        if d == nodata_depth || d.is_nan() {
-            depth_pixels.extend_from_slice(&[0, 0, 0, 0]);
-        } else {
-            let norm = ((d - min_d) / (max_d - min_d + 0.0001)).clamp(0.0, 1.0);
-            let r = ((1.0 - norm) * 255.0) as u8;
-            let g = ((1.0 - (norm - 0.5).abs() * 2.0) * 255.0).max(0.0) as u8;
-            let b = (norm * 255.0) as u8;
-            depth_pixels.extend_from_slice(&[r, g, b, 255]);
-        }
+    depth_pixels
+        .par_chunks_exact_mut(4)
+        .zip(depth_buffer.par_iter())
+        .for_each(|(pixel, &d)| {
+            if d == nodata_depth || d.is_nan() {
+                pixel.copy_from_slice(&[0, 0, 0, 0]);
+            } else {
+                let norm = ((d - min_d) / (max_d - min_d + 0.0001)).clamp(0.0, 1.0);
+                let r = ((1.0 - norm) * 255.0) as u8;
+                let g = ((1.0 - (norm - 0.5).abs() * 2.0) * 255.0).max(0.0) as u8;
+                let b = (norm * 255.0) as u8;
+                pixel.copy_from_slice(&[r, g, b, 255]);
+            }
+        });
 
-        if u == nodata_unc || u.is_nan() {
-            unc_pixels.extend_from_slice(&[0, 0, 0, 0]);
-        } else {
-            let u_norm = (u / 2.0).clamp(0.0, 1.0);
-            let ur = (u_norm * 255.0) as u8;
-            let ug = ((1.0 - u_norm) * 255.0) as u8;
-            unc_pixels.extend_from_slice(&[ur, ug, 50, 255]);
-        }
-    }
+    unc_pixels
+        .par_chunks_exact_mut(4)
+        .zip(unc_buffer.par_iter())
+        .for_each(|(pixel, &u)| {
+            if u == nodata_unc || u.is_nan() {
+                pixel.copy_from_slice(&[0, 0, 0, 0]);
+            } else {
+                let u_norm = (u / 2.0).clamp(0.0, 1.0);
+                let ur = (u_norm * 255.0) as u8;
+                let ug = ((1.0 - u_norm) * 255.0) as u8;
+                pixel.copy_from_slice(&[ur, ug, 50, 255]);
+            }
+        });
 
     let depth_img = egui::ColorImage::from_rgba_unmultiplied([width, height], &depth_pixels);
     let unc_img = egui::ColorImage::from_rgba_unmultiplied([width, height], &unc_pixels);
@@ -214,7 +223,6 @@ pub fn load_real_bag(
         base_res,
         min_res,
         max_res,
-        
         vertical_datum_code: vert_datum_code,
     };
 
@@ -281,30 +289,41 @@ pub fn export_to_s102(
         .data()
         .to_vec();
 
-    let mut points = Vec::new();
-    if points.try_reserve(total_points).is_err() {
-        return Err("❌ 系統記憶體不足，無法分配向量空間！".to_string());
-    }
+    // --- Rayon 平行建構 S102Point 矩陣並完成 Y 軸轉置 (西南角原點對齊) ---
+    let mut points = vec![
+        S102Point {
+            depth: 1000000.0,
+            uncertainty: 1000000.0
+        };
+        total_points
+    ];
 
-    for row in (0..export_h).rev() {
-        for col in 0..export_w {
-            let i = row * export_w + col;
-            let mut d = depth_data[i];
-            let u = unc_data[i];
+    points
+        .par_chunks_exact_mut(export_w)
+        .enumerate()
+        .for_each(|(out_row_idx, row_slice)| {
+            // S-102 原點在西南角 (Bottom-Up)，GDAL 讀取為西北角 (Top-Down)
+            let source_row = export_h - 1 - out_row_idx;
+            let row_offset = source_row * export_w;
 
-            let is_d_invalid = d == nodata_d || d.is_nan();
-            let is_u_invalid = u == nodata_u || u.is_nan();
+            for col in 0..export_w {
+                let i = row_offset + col;
+                let mut d = depth_data[i];
+                let u = unc_data[i];
 
-            if !is_d_invalid && auto_align_depth {
-                d = -d;
+                let is_d_invalid = d == nodata_d || d.is_nan();
+                let is_u_invalid = u == nodata_u || u.is_nan();
+
+                if !is_d_invalid && auto_align_depth {
+                    d = -d;
+                }
+
+                row_slice[col] = S102Point {
+                    depth: if is_d_invalid { 1000000.0 } else { d },
+                    uncertainty: if is_u_invalid { 1000000.0 } else { u },
+                };
             }
-
-            points.push(S102Point {
-                depth: if is_d_invalid { 1000000.0 } else { d },
-                uncertainty: if is_u_invalid { 1000000.0 } else { u },
-            });
-        }
-    }
+        });
 
     let min_x = geo_transform[0];
     let max_x = min_x + (export_w as f64 * target_res);
@@ -333,7 +352,7 @@ pub fn export_to_s102(
     .map_err(|e| format!("寫入 S-102 HDF5 失敗: {}", e))?;
 
     Ok(format!(
-        "轉檔成功！目標解析度: {:.2}m, 維度: {}x{}, 水平 EPSG: {} (QGIS請選擇此CRS)",
+        "🎉 轉檔成功！目標解析度: {:.2}m, 維度: {}x{}, 水平 EPSG: {} (QGIS請選擇此CRS)",
         target_res, export_w, export_h, final_epsg
     ))
 }

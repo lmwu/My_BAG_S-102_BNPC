@@ -2,6 +2,7 @@ mod app;
 mod io;
 mod models;
 mod utils;
+mod bnpc;
 
 use app::VrBagApp;
 use eframe::egui;
@@ -9,6 +10,9 @@ use eframe::egui;
 const BUNDLED_FONT: &[u8] = include_bytes!("../assets/FZYTK.ttf");
 
 fn main() -> eframe::Result<()> {
+    // 啟用 GDAL 底層多執行緒解碼與重採樣加速
+    gdal::config::set_config_option("GDAL_NUM_THREADS", "ALL_CPUS").ok();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1600.0, 900.0])
